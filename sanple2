@@ -1,0 +1,69 @@
+import { StreamingTextResponse, LangChainStream, Message, streamToResponse, OpenAIStream} from "ai";
+import { ChatOpenAI } from "langchain/chat_models/openai";
+import { RecursiveCharacterTextSplitter, CharacterTextSplitter } from "langchain/text_splitter";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { AIMessage, HumanMessage } from "langchain/schema";
+import { loadSummarizationChain, ConversationChain, SimpleSequentialChain, loadQAStuffChain, loadQARefineChain,loadQAMapReduceChain  } from "langchain/chains";
+import { NextRequest } from "next/server";
+import { Document } from "langchain/document";
+import {
+  ChatPromptTemplate,
+  HumanMessagePromptTemplate,
+  MessagesPlaceholder,
+  SystemMessagePromptTemplate,
+  PromptTemplate,
+} from "langchain/prompts";
+import { useContext } from 'react';
+import { useChatContext } from "../../chat-context";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+
+export const runtime = "edge";
+
+export async function POST(req: Request) {
+  const { messages, outputLang } = await req.json();
+  const lastHumanMessage = await messages[messages.length - 1];
+  const { stream, handlers } = LangChainStream();
+
+  const llm = new ChatOpenAI({
+    modelName: "gpt-3.5-turbo",
+    streaming: true,
+    temperature: 0.9,
+  });
+
+  /*
+  const chatPrompt = ChatPromptTemplate.fromPromptMessages([
+    SystemMessagePromptTemplate.fromTemplate(
+      `- You are who is a helpful AI Assistant that translates into ${outputLang}.
+      - You will provide clear and concise queries, and you will respond with polite and professional answers.
+      - You will answer within 50 characters.
+      - All conversations from here on will be in Japanese.`
+    ),
+    //
+
+    // new MessagesPlaceholder("history"),
+    HumanMessagePromptTemplate.fromTemplate(`{input} All conversations from here on will be in Japanese.`),
+  ]);
+  const chain = new ConversationChain({
+    llm,
+    prompt: chatPrompt,
+  });
+  chain
+    .call({ input: lastHumanMessage.content}, [handlers])
+    .catch(console.error);
+  */
+
+  const question = "Please summarize within 1000 characters";
+  const textSplitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000 });
+  const docs = await textSplitter.createDocuments([lastHumanMessage.content])
+  const chainA = loadQAMapReduceChain(llm, {
+    returnIntermediateSteps: true,
+  });
+  chainA.call(
+    {
+      input_documents: docs, 
+      question,
+    },
+    [handlers]);
+
+  return new StreamingTextResponse(stream);
+}
