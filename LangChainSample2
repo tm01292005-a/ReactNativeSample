@@ -1,0 +1,201 @@
+import { StreamingTextResponse, LangChainStream, OpenAIStream } from "ai";
+import { ChatOpenAI } from "langchain/chat_models/openai";
+import {
+  RecursiveCharacterTextSplitter,
+  CharacterTextSplitter,
+} from "langchain/text_splitter";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { BufferMemory } from "langchain/memory";
+import {
+  LLMChain,
+  loadSummarizationChain,
+  RetrievalQAChain,
+  ConversationChain,
+  SimpleSequentialChain,
+  loadQAStuffChain,
+  loadQARefineChain,
+  loadQAMapReduceChain,
+} from "langchain/chains";
+import {
+  ChatPromptTemplate,
+  HumanMessagePromptTemplate,
+  MessagesPlaceholder,
+  SystemMessagePromptTemplate,
+  PromptTemplate,
+} from "langchain/prompts";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+
+export const runtime = "edge";
+
+export async function POST(req: Request, res: Response) {
+  const { stream, handlers } = LangChainStream();
+
+  // チャットメッセージ取得
+  const { messages, outputLang } = await req.json();
+  const lastHumanMessage = await messages[messages.length - 1];
+
+  // チャットメッセージをドキュメント化
+  const textSplitter = new CharacterTextSplitter({
+    separator: " ",
+    chunkSize: 1000,
+    chunkOverlap: 0,
+  });
+  const docs = await textSplitter.createDocuments([lastHumanMessage.content]);
+
+  /*
+  const chainA = loadQAMapReduceChain(llm, {
+    returnIntermediateSteps: true,
+  });
+  chainA.call(
+    {
+      input_documents: vectorStoreData, 
+      question,
+    },
+    [handlers]);
+*/
+  const map_prompt_template = ChatPromptTemplate.fromPromptMessages([
+    SystemMessagePromptTemplate.fromTemplate(`Summarize the following text.`),
+    HumanMessagePromptTemplate.fromTemplate("{text}"),
+  ]);
+  const map_combine_template = ChatPromptTemplate.fromPromptMessages([
+    SystemMessagePromptTemplate.fromTemplate(
+      `Prepare the minutes based on the following text.
+    [Rule]
+    - Use bullet points.
+    
+    [Format]  
+    ## Title:  
+    ## Date&time:  
+    ## Location:  
+    ## Participants:  
+    ## Agenda:  
+    ## Action items:  
+    ## Decision:  `
+    ),
+    HumanMessagePromptTemplate.fromTemplate("{text}"),
+  ]);
+
+  const map_first_prompt = new ChatPromptTemplate(map_prompt_template);
+  const map_combine_prompt = new ChatPromptTemplate(map_combine_template);
+  const llm = new ChatOpenAI({
+    temperature: 0,
+    modelName: "gpt-3.5-turbo",
+    streaming: false,
+  });
+  const collapseLlm = new ChatOpenAI({
+    temperature: 0,
+    modelName: "gpt-3.5-turbo",
+    streaming: true,
+  });
+  const map_chain = loadSummarizationChain(llm, {
+    type: "map_reduce",
+    combineMapPrompt: map_first_prompt,
+    combinePrompt: map_combine_prompt,
+    combineLLM: collapseLlm,
+    verbose: true,
+  });
+  map_chain.call(
+    {
+      input_documents: docs,
+      token_max: 4000,
+      returnOnlyOutputs: true,
+    },
+    [handlers]
+  );
+
+  /*
+
+
+
+  // ベクターストア(長い文章をベクトル化するために使用)
+  const embeddings = new OpenAIEmbeddings({
+    openAIApiKey: process.env.OPENAI_API_KEY,
+  });
+  const vectorStoreData = await MemoryVectorStore.fromDocuments(
+    docs,
+    embeddings
+  );
+
+  // 言語把握用LLM
+  const languageLlm = new ChatOpenAI({
+    modelName: "gpt-3.5-turbo",
+    streaming: false,
+    temperature: 0,
+  });
+  // 言語把握用チェーン
+  const languageChain = RetrievalQAChain.fromLLM(
+    languageLlm,
+    vectorStoreData.asRetriever(),
+    {
+      returnSourceDocuments: false,
+    }
+  );
+  const outputLanguage = await languageChain.run(
+    "return only one language that is mainly included in the sentence."
+  );
+  console.log("言語: ", outputLanguage);
+
+  // 議事録作成用LLM
+  const agendaLlm = new ChatOpenAI({
+    modelName: "gpt-3.5-turbo",
+    streaming: false, // チェーンでつなぐためストリームはOFF
+    temperature: 0,
+  });
+  // 議事録作成用チェーン
+  const agendaChain = RetrievalQAChain.fromLLM(
+    agendaLlm,
+    chainType: "refine",
+    vectorStoreData.asRetriever(),
+    {
+      returnSourceDocuments: false,
+    }
+  );
+
+  // 翻訳用LLM
+  const translateLlm = new ChatOpenAI({
+    modelName: "gpt-3.5-turbo",
+    streaming: true,
+    temperature: 0,
+  });
+  // 翻訳用プロンプトテンプレート
+  const translatePrompt = new PromptTemplate({
+    inputVariables: ["agenda"],
+    template: `Translate to ${outputLanguage}.
+  
+      {agenda}
+      `,
+  });
+  // 翻訳用チェーン
+  const translateChain = new LLMChain({
+    llm: translateLlm,
+    prompt: translatePrompt,
+  });
+
+  // 結合用チェーン
+  const overallChain = new SimpleSequentialChain({
+    chains: [agendaChain, translateChain],
+    verbose: true, // Chainの内部状態をログ出力するか
+  });
+  // 実行
+  const question = `Please create the minutes according to the rules. and Please store the source language of the minutes in "lang"
+  [Rules]
+  - Include title, date, location, attendees, topics, todo items, and decisions.
+  [Format]
+  ## Title:  
+  ## Date:  
+  ## Location:  
+  ## Attendees:  
+  ## Topics:  
+  ## Todo:  
+  ## Decisions:  `;
+  overallChain
+    .call(
+      {
+        input: question,
+      },
+      [handlers]
+    )
+    .catch(console.error);
+*/
+  return new StreamingTextResponse(stream);
+}
