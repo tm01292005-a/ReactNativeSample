@@ -1,0 +1,136 @@
+import type { NextApiResponse } from "next";
+import {
+  uploadBlob,
+  downloadBlob,
+  uploadBlobForMp4 as uploadBlobForM4a,
+} from "@/features/audio/audio-services/audio-storage-service";
+import { createTranscription } from "@/features/audio/audio-services/audio-speech-services";
+import {
+  UpdateTranscriptionId,
+  UpdateStatusAndErrorBtId,
+} from "@/features/audio/audio-services/audio-record-service";
+import { TRANSLATE_STATUS } from "@/features/audio/audio-services/models";
+import { spawn } from "child_process";
+import { PassThrough } from "stream";
+import { Readable } from "stream";
+import { promises as fs } from "fs";
+
+const processAudioTranscript = async (
+  id: string,
+  fileName: string,
+  locale: string,
+  blobPath: string
+) => {
+  try {
+    const transcriptionId = await createTranscription(
+      fileName,
+      locale,
+      blobPath
+    );
+    await UpdateTranscriptionId(id, transcriptionId);
+  } catch (error) {
+    if (error instanceof Error) {
+      await UpdateStatusAndErrorBtId(
+        id,
+        TRANSLATE_STATUS.FAILED,
+        error.message
+      );
+    }
+  }
+};
+
+export async function POST(req: Request, res: NextApiResponse) {
+  try {
+    const formData: any = await req.formData();
+
+    const id: string = formData.get("id");
+    let blobPath: string = formData.get("blobPath");
+    const file: Blob = formData.get("file");
+    const blockId: string = formData.get("blockId");
+    const blockList: string = formData.get("blockList");
+    const latestflag: boolean = Boolean(parseInt(formData.get("latestflag")));
+    const fileNumber: string = formData.get("fileNumber");
+    const locale: string = formData.get("locale");
+    const fileType: string = formData.get("fileType");
+
+    await uploadBlob(
+      blobPath,
+      Buffer.from(await file.arrayBuffer()),
+      blockId,
+      blockList.split(","),
+      latestflag,
+      fileNumber
+    );
+
+    if (latestflag) {
+      if (fileType === "ｓm4a") {
+        const mp3Blob = await convertMp4ToMp3(await downloadBlob(blobPath));
+
+        // TODO あとで消す
+        const arrayBuffer = await new Response(mp3Blob).arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        await fs.writeFile("output.mp3", buffer);
+
+        if (mp3Blob) {
+          blobPath = blobPath.replace(".m4a", ".mp3");
+          await uploadBlobForM4a(
+            blobPath,
+            Buffer.from(await mp3Blob.arrayBuffer())
+          );
+        }
+      }
+      await processAudioTranscript(id, file.name, locale, blobPath);
+    }
+
+    const options = { status: 200 };
+    return new Response("", options);
+  } catch (error) {
+    console.error(error);
+    const options = { status: 500 };
+    return new Response("", options);
+  }
+}
+
+const convertMp4ToMp3 = async (file: Buffer): Promise<Blob> => {
+  return new Promise((resolve, reject) => {
+    const inputStream = Readable.from(file);
+    const outputStream = new PassThrough();
+
+    const command = spawn("ffmpeg", [
+      "-i",
+      "pipe:0",
+      "-vn",
+      "-ar",
+      "44100",
+      "-ac",
+      "2",
+      "-b:a",
+      "192k",
+      "-f",
+      "mp3",
+      "pipe:1",
+    ]);
+
+    inputStream.pipe(command.stdin);
+    command.stdout.pipe(outputStream);
+
+    const chunks: Uint8Array[] = [];
+    outputStream.on("data", (chunk) => {
+      chunks.push(chunk);
+    });
+
+    command.on("close", (code: number) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      } else {
+        const buffer = Buffer.concat(chunks);
+        const blob = new Blob([buffer], { type: "audio/mp3" });
+        resolve(blob);
+      }
+    });
+    inputStream.on("error", reject);
+    outputStream.on("error", reject);
+    command.stdin.on("error", reject);
+    command.stdout.on("error", reject);
+  });
+};
